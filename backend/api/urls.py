@@ -33,6 +33,8 @@ urlpatterns = [
 
     path('sso/callback/', views.sso_callback, name='sso_callback'),
     path('me/', views.me, name='me'),
+    path('env/', views.env_info, name='env_info'),
+    path('login/', views.local_login, name='local_login'),
 
     # Alert Endpoints
     path('alerts/', views.alert_list, name='alert_list'),

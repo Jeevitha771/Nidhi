@@ -5,6 +5,9 @@ from rest_framework.exceptions import AuthenticationFailed
 from django.contrib.auth.models import User
 from django.conf import settings
 
+# Token issued by the local /api/login/ endpoint when ENVIRONMENT=nexusserver.
+NEXUS_LOCAL_TOKEN = 'nexusserver-local-token'
+
 class RubixTokenAuthentication(BaseAuthentication):
     """
     Custom authentication class that verifies a token against the Rubix IT Solutions IdP.
@@ -15,7 +18,13 @@ class RubixTokenAuthentication(BaseAuthentication):
             return None
 
         token = auth_header.split(' ')[1]
-        
+
+        # Local login mode for the 'nexusserver' deployment (no Rubix IdP reachable)
+        if os.environ.get('ENVIRONMENT', '').lower() == 'nexusserver' and token == NEXUS_LOCAL_TOKEN:
+            user, _ = User.objects.get_or_create(username='jeevitha')
+            user.role = 'founding_engineer'
+            return (user, token)
+
         # Call the Rubix IdP introspection or userinfo endpoint
         # The main Django OAuth toolkit typically provides an introspection endpoint 
         # or we can simply verify it against a protected resource on Rubix

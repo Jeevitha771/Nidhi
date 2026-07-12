@@ -14,6 +14,8 @@ from django.utils import timezone
 from .models import DatabaseServer, Product, DatabaseInstance, DatabaseBackup, EmployeeProductAssignment, StorageBucket
 from .serializers import DatabaseServerSerializer, ProductSerializer, DatabaseInstanceSerializer, DatabaseBackupSerializer
 from .permissions import IsFoundingEngineer
+from django.contrib.auth.models import User
+from .authentication import NEXUS_LOCAL_TOKEN
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -375,6 +377,32 @@ def me(request):
         'username': request.user.username,
         'role': getattr(request.user, 'role', 'employee')
     })
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def env_info(request):
+    return Response({'environment': os.environ.get('ENVIRONMENT', '')})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def local_login(request):
+    """Local username/password login, only enabled when ENVIRONMENT=nexusserver."""
+    if os.environ.get('ENVIRONMENT', '').lower() != 'nexusserver':
+        return Response({'error': 'Local login is disabled in this environment.'},
+                        status=status.HTTP_403_FORBIDDEN)
+
+    username = (request.data.get('username') or '').strip()
+    password = request.data.get('password') or ''
+    if username == 'jeevitha' and password == '123456':
+        user, _ = User.objects.get_or_create(username='jeevitha')
+        return Response({
+            'token': NEXUS_LOCAL_TOKEN,
+            'username': 'jeevitha',
+            'role': 'founding_engineer',
+        })
+    return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
