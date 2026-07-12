@@ -108,7 +108,27 @@ services:
       - "-c"
       - "max_connections=200"
 
+  # --- Cassandra data-plane (optional, for Nexus OMS PRO-mode audit store) ---
+  # Register this node in Nidhi as a Cassandra server (engine=cassandra, port 9042).
+  cassandra_db:
+    restart: unless-stopped
+    image: cassandra:5
+    volumes:
+      - cassandra_data:/var/lib/cassandra/data
+    environment:
+      - CASSANDRA_CLUSTER_NAME=nidhi
+      - CASSANDRA_DC=dc1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+    ports:
+      - "9042:9042" # Native protocol port
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
 volumes:
   nidhi_postgres_data:
   main_postgres_data:
+  cassandra_data:
   minio_data: # Add the new volume

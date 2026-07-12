@@ -20,7 +20,7 @@ const AdminDashboard = () => {
 
   // Forms state
   const [newProduct, setNewProduct] = useState({ name: '', description: '' });
-  const [newServer, setNewServer] = useState({ name: '', host: '', port: '5432', root_user: 'postgres', root_password: '', environment_type: 'prod' });
+  const [newServer, setNewServer] = useState({ name: '', host: '', engine: 'postgresql', port: '5432', root_user: 'postgres', root_password: '', environment_type: 'prod' });
 
   useEffect(() => {
     fetchServers();
@@ -90,7 +90,7 @@ const AdminDashboard = () => {
   const handleCreateServer = async (e) => {
     e.preventDefault();
     try {
-      const payload = { ...newServer, port: parseInt(newServer.port) };
+      const payload = { ...newServer, port: parseInt(newServer.port) || (newServer.engine === 'cassandra' ? 9042 : 5432) };
       const res = await fetch(`/nidhi-api/servers/`, {
         method: 'POST',
         headers: getHeaders(),
@@ -98,7 +98,7 @@ const AdminDashboard = () => {
       });
       if (res.ok) {
         showToast("Server added!", 'success');
-        setNewServer({ name: '', host: '', port: '5432', root_user: 'postgres', root_password: '', environment_type: 'prod' });
+        setNewServer({ name: '', host: '', engine: 'postgresql', port: '5432', root_user: 'postgres', root_password: '', environment_type: 'prod' });
         fetchServers();
       } else {
         showToast("Failed to add server.", 'error');
@@ -224,19 +224,23 @@ const AdminDashboard = () => {
             <div className="bg-white dark:bg-slate-800/40 backdrop-blur-md border border-slate-300 dark:border-slate-700 rounded-xl overflow-hidden shadow-xl">
               <table className="w-full text-left">
                 <thead className="bg-slate-100 dark:bg-slate-800/80 text-slate-500 dark:text-slate-400 text-xs uppercase tracking-wider">
-                  <tr>
-                    <th className="px-6 py-4">Database</th>
-                    <th className="px-6 py-4">Node</th>
-                    <th className="px-6 py-4">Status</th>
-                    <th className="px-6 py-4">Created By</th>
-                    <th className="px-6 py-4">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-200 dark:divide-slate-700/50">
-                  {instances.map(db => (
-                    <tr key={db.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/60 transition">
-                      <td className="px-6 py-4 font-semibold">{db.db_name}</td>
-                      <td className="px-6 py-4 text-slate-500 dark:text-slate-400">{db.server_name}</td>
+                   <tr>
+                     <th className="px-6 py-4">Database</th>
+                     <th className="px-6 py-4">Node</th>
+                     <th className="px-6 py-4">Engine</th>
+                     <th className="px-6 py-4">Status</th>
+                     <th className="px-6 py-4">Created By</th>
+                     <th className="px-6 py-4">Actions</th>
+                   </tr>
+                 </thead>
+                 <tbody className="divide-y divide-slate-200 dark:divide-slate-700/50">
+                   {instances.map(db => (
+                     <tr key={db.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/60 transition">
+                       <td className="px-6 py-4 font-semibold">{db.db_name}</td>
+                       <td className="px-6 py-4 text-slate-500 dark:text-slate-400">{db.server_name}</td>
+                       <td className="px-6 py-4">
+                         <span className="px-2 py-1 text-xs rounded-full bg-indigo-100 dark:bg-indigo-500/20 text-indigo-600 dark:text-indigo-300 uppercase">{db.engine}</span>
+                       </td>
                       <td className="px-6 py-4">
                         <span className={`px-2 py-1 text-xs rounded-full border ${db.status === 'available' ? 'bg-[#4ade80]/20 text-emerald-600 dark:text-[#98FF98] border-[#4ade80]/40' : 'bg-red-500/10 text-red-500 dark:text-red-400 border-red-500/20'}`}>
                           {db.status.toUpperCase()}
@@ -267,6 +271,12 @@ const AdminDashboard = () => {
                 <form onSubmit={handleCreateServer} className="space-y-4">
                   <div><label className="text-xs text-slate-500 dark:text-slate-400">Name</label><input required className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 p-2 rounded" value={newServer.name} onChange={e => setNewServer({...newServer, name: e.target.value})} placeholder="Prod DB 1"/></div>
                   <div><label className="text-xs text-slate-500 dark:text-slate-400">Host</label><input required className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 p-2 rounded" value={newServer.host} onChange={e => setNewServer({...newServer, host: e.target.value})} placeholder="10.0.0.5"/></div>
+                  <div><label className="text-xs text-slate-500 dark:text-slate-400">Engine</label>
+                    <select className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 p-2 rounded" value={newServer.engine} onChange={e => setNewServer({...newServer, engine: e.target.value, port: e.target.value === 'cassandra' ? '9042' : '5432', root_user: e.target.value === 'cassandra' ? 'cassandra' : 'postgres'})}>
+                      <option value="postgresql">PostgreSQL</option>
+                      <option value="cassandra">Cassandra</option>
+                    </select>
+                  </div>
                   <div><label className="text-xs text-slate-500 dark:text-slate-400">Port</label><input required type="number" className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 p-2 rounded" value={newServer.port} onChange={e => setNewServer({...newServer, port: e.target.value})}/></div>
                   <div><label className="text-xs text-slate-500 dark:text-slate-400">Root User</label><input required className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 p-2 rounded" value={newServer.root_user} onChange={e => setNewServer({...newServer, root_user: e.target.value})}/></div>
                   <div><label className="text-xs text-slate-500 dark:text-slate-400">Root Password</label><input required type="password" className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 p-2 rounded" value={newServer.root_password} onChange={e => setNewServer({...newServer, root_password: e.target.value})}/></div>
@@ -288,7 +298,10 @@ const AdminDashboard = () => {
                       <span className="font-semibold text-lg">{server.name}</span>
                     </div>
                     <p className="text-sm text-slate-600 dark:text-slate-400 mb-2">{server.host}:{server.port}</p>
-                    <span className="px-2 py-1 text-xs bg-slate-200 dark:bg-slate-700 rounded uppercase">{server.environment_type}</span>
+                    <div className="flex gap-2">
+                      <span className="px-2 py-1 text-xs bg-slate-200 dark:bg-slate-700 rounded uppercase">{server.environment_type}</span>
+                      <span className="px-2 py-1 text-xs bg-indigo-100 dark:bg-indigo-500/20 text-indigo-600 dark:text-indigo-300 rounded uppercase">{server.engine}</span>
+                    </div>
                   </div>
                 ))}
               </div>

@@ -13,3 +13,10 @@ celery
 redis
 django-celery-beat
 minio
+
+# Multi-engine support: Cassandra / Scylla driver (used by Nexus OMS PRO mode)
+cassandra-driver
+
+# NOTE: Cassandra backups/restores shell out to `cqlsh`. Install it on the
+# backend/worker image (e.g. `apt-get install -y cassandra-tools` or the
+# `cqlsh` PyPI package) when managing Cassandra instances.

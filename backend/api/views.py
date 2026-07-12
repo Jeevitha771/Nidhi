@@ -1,12 +1,10 @@
 # Founding Engineer: Aadisheshu <safacts001@gmail.com>
 import os
-import psycopg2
 import requests
 import secrets
 import string
 import subprocess
 import tempfile
-from psycopg2 import sql
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -46,6 +44,7 @@ def sso_callback(request):
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 from django.conf import settings
+from .engine_drivers import get_driver, default_port_for_engine
 
 @api_view(['POST'])
 @authentication_classes([])
@@ -62,13 +61,18 @@ def auto_register_server(request):
         return Response({"error": "Unauthorized registration token"}, status=status.HTTP_401_UNAUTHORIZED)
         
     data = request.data
-    # Create the server directly
+    engine = data.get('engine', 'postgresql')
+    # Default the port to the engine's standard port when not supplied.
+    port = data.get('port') or default_port_for_engine(engine)
+    # Default the super-user to the engine default (postgres / cassandra).
+    root_user = data.get('root_user') or get_driver(engine).root_user_default()
     try:
         server = DatabaseServer.objects.create(
             name=data.get('name', 'Auto-Registered Node'),
             host=data.get('host'),
-            port=data.get('port', 5432),
-            root_user=data.get('root_user', 'postgres'),
+            engine=engine,
+            port=port,
+            root_user=root_user,
             root_password=data.get('root_password'),
             environment_type='production',
             is_active=True
@@ -93,6 +97,7 @@ def auto_provision_instance(request):
         
     project_slug = request.data.get('project_slug', '').lower().replace(' ', '_')
     environment = request.data.get('environment', 'production').lower()
+    engine = request.data.get('engine', 'postgresql')
     
     if not project_slug:
         return Response({"error": "project_slug is required"}, status=status.HTTP_400_BAD_REQUEST)
@@ -109,6 +114,7 @@ def auto_provision_instance(request):
     existing_instance = DatabaseInstance.objects.filter(
         product=product,
         server__environment_type=environment,
+        engine=engine,
         is_deleted=False
     ).first()
     
@@ -116,7 +122,8 @@ def auto_provision_instance(request):
         if existing_instance.status != 'available':
             return Response({"error": "Instance is not yet available"}, status=status.HTTP_400_BAD_REQUEST)
         
-        db_url = f"postgres://{existing_instance.db_user}:{existing_instance.db_password_temp}@{existing_instance.server.host}:{existing_instance.server.port}/{existing_instance.db_name}"
+        driver = get_driver(existing_instance.engine)
+        db_url = driver.build_connection_string(existing_instance.server, existing_instance)
         
         # Match bucket by name convention: {slug}-{environment}-media
         # (more reliable than server-based lookup since buckets can share the same server)
@@ -126,7 +133,7 @@ def auto_provision_instance(request):
             status='available'
         ).first()
         
-        response_data = {"database_url": db_url}
+        response_data = {"database_url": db_url, "engine": existing_instance.engine}
         
         if bucket and bucket.status == 'available':
             response_data["bucket_name"] = bucket.bucket_name
@@ -138,10 +145,12 @@ def auto_provision_instance(request):
         
         return Response(response_data, status=status.HTTP_200_OK)
         
-    # 3. Find available server
-    server = DatabaseServer.objects.filter(environment_type=environment, is_active=True).first()
+    # 3. Find available server for the requested engine + environment
+    server = DatabaseServer.objects.filter(
+        engine=engine, environment_type=environment, is_active=True
+    ).first()
     if not server:
-        return Response({"error": f"No active server found for environment '{environment}'"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({"error": f"No active {engine} server found for environment '{environment}'"}, status=status.HTTP_500_INTERNAL_ERROR)
         
     # 4. Provision new database
     db_name = f"{project_slug.replace('-', '_')}_{environment}"[:50]
@@ -155,6 +164,7 @@ def auto_provision_instance(request):
     instance = DatabaseInstance(
         server=server,
         product=product,
+        engine=engine,
         db_name=db_name,
         db_user=db_user,
         db_password_temp=new_password,
@@ -196,10 +206,13 @@ def auto_provision_instance(request):
     if bucket.status == 'provisioning':
         provision_bucket_task.delay(bucket.id)
 
-    db_url = f"postgres://{db_user}:{new_password}@{server.host}:{server.port}/{db_name}"
+    driver = get_driver(engine)
+    db_url = driver.build_connection_string(server, instance)
     
     # Return bucket credentials if available or provisioning
     bucket_response = {
+        "database_url": db_url,
+        "engine": engine,
         "bucket_name": bucket_name,
         "bucket_endpoint": bucket.endpoint,
         "bucket_id": str(bucket.id),
@@ -278,6 +291,7 @@ def database_instance_list_create(request):
         instance = DatabaseInstance(
             server=server,
             product=product,
+            engine=server.engine,
             db_name=db_name,
             db_user=db_user,
             db_password_temp=new_password,
@@ -298,57 +312,35 @@ def delete_database(request, instance_id):
     """Soft Delete: Revokes access on the DB but keeps the data intact."""
     instance = get_object_or_404(DatabaseInstance, id=instance_id, is_deleted=False)
     server = instance.server
-    
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname="postgres",
-            user=server.root_user,
-            password=server.root_password,
-            host=server.host,
-            port=server.port
-        )
-        conn.autocommit = True
-        cursor = conn.cursor()
 
-        # Revoke connect privilege from public and the specific user
-        revoke_query = sql.SQL("REVOKE CONNECT ON DATABASE {db_name} FROM PUBLIC, {user};").format(
-            db_name=sql.Identifier(instance.db_name),
-            user=sql.Identifier(instance.db_user)
-        )
-        cursor.execute(revoke_query)
-        
-        # Optionally, terminate active connections to immediately enforce revocation
-        terminate_query = sql.SQL("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s;")
-        cursor.execute(terminate_query, [instance.db_name])
-        
-        cursor.close()
-        
+    try:
+        driver = get_driver(instance.engine)
+        driver.delete(server, instance)
+
         # Soft delete record
         instance.is_deleted = True
         instance.deleted_at = timezone.now()
         instance.status = 'stopped'
         instance.save()
-        
-        return Response({"message": "Database access revoked and soft deleted successfully."}, status=status.HTTP_200_OK)
+
+        return Response({"message": "Database access revoked and soft deleted successfully.", "engine": instance.engine}, status=status.HTTP_200_OK)
 
     except Exception as e:
-        return Response({"error": f"Failed to soft-delete database: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    finally:
-        if conn:
-            conn.close()
+        return Response({"error": f"Failed to soft-delete database: {str(e)}"}, status=status.HTTP_500_INTERNAL_ERROR)
 
 @api_view(['GET'])
 @permission_classes([IsFoundingEngineer])
 def reveal_credentials(request, instance_id):
     instance = get_object_or_404(DatabaseInstance, id=instance_id, is_deleted=False)
+    driver = get_driver(instance.engine)
     credentials = {
+        "engine": instance.engine,
         "host": instance.server.host,
         "port": instance.server.port,
         "db_name": instance.db_name,
         "db_user": instance.db_user,
         "db_password": instance.db_password_temp,
-        "connection_string": f"postgres://{instance.db_user}:{instance.db_password_temp}@{instance.server.host}:{instance.server.port}/{instance.db_name}"
+        "connection_string": driver.build_connection_string(instance.server, instance)
     }
     return Response(credentials, status=status.HTTP_200_OK)
 
@@ -366,11 +358,12 @@ def replicate_to_dev(request, instance_id):
         
     from .tasks import replicate_prod_to_dev
     
-    # Trigger celery task
-    replicate_prod_to_dev.delay(prod_instance.id, dev_server_id, new_db_name)
+    # Trigger celery task (engine carried along so target matches source engine)
+    replicate_prod_to_dev.delay(prod_instance.id, dev_server_id, new_db_name, prod_instance.engine)
     
     return Response({
         "message": "Replication task triggered successfully.",
+        "engine": prod_instance.engine,
         "source_db": prod_instance.db_name,
         "target_db": new_db_name
     }, status=status.HTTP_202_ACCEPTED)
@@ -393,6 +386,7 @@ def alert_list(request):
     return Response(serializer.data)
 
 @api_view(['POST'])
+@api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def alert_mark_read(request, alert_id):
     from .models import SystemAlert
@@ -410,3 +404,58 @@ def alert_mark_all_read(request):
     from .models import SystemAlert
     SystemAlert.objects.filter(is_read=False).update(is_read=True)
     return Response({"status": "all marked read"}, status=status.HTTP_200_OK)
+
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def receive_heartbeat(request):
+    """
+    Receives heartbeat from apps to ensure they are using Nidhi-provisioned databases.
+    Protected by NIDHI_APP_API_KEY.
+    """
+    token = request.headers.get('Authorization', '')
+    expected_token = f"Bearer {getattr(settings, 'NIDHI_APP_API_KEY', 'super_secret_app_api_key_123')}"
+    
+    if token != expected_token:
+        return Response({"error": "Unauthorized API key"}, status=status.HTTP_401_UNAUTHORIZED)
+        
+    project_slug = request.data.get('project_slug')
+    environment = request.data.get('environment', 'prod').lower()
+    db_url = request.data.get('db_url')
+    
+    if not all([project_slug, environment, db_url]):
+        return Response({"error": "project_slug, environment, and db_url are required"}, status=status.HTTP_400_BAD_REQUEST)
+        
+    # Check if instance is provisioned
+    instance = DatabaseInstance.objects.filter(
+        product__name=project_slug,
+        server__environment_type=environment,
+        is_deleted=False
+    ).first()
+    
+    if not instance:
+        logger.warning(f"Heartbeat received for unknown instance: {project_slug} ({environment})")
+        return Response({"status": "unknown_instance"}, status=status.HTTP_200_OK)
+        
+    driver = get_driver(instance.engine)
+    expected_db_url = driver.build_connection_string(instance.server, instance)
+    
+    if db_url != expected_db_url:
+        logger.warning(f"Database mismatch for {project_slug} ({environment}). Expected: {expected_db_url}, Received: {db_url}")
+        
+        # Send Telegram notification
+        telegram_bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+        telegram_chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+        
+        if telegram_bot_token and telegram_chat_id:
+            message = f"🚨 *Database Mismatch Alert* 🚨\n\n*App:* {project_slug} ({environment})\n*Expected:* {expected_db_url}\n*Actual:* {db_url}"
+            telegram_url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
+            payload = {'chat_id': telegram_chat_id, 'text': message, 'parse_mode': 'Markdown'}
+            try:
+                requests.post(telegram_url, json=payload, timeout=10)
+            except Exception as e:
+                logger.error(f"Failed to send Telegram notification: {str(e)}")
+                
+        return Response({"status": "mismatch", "expected": expected_db_url}, status=status.HTTP_200_OK)
+        
+    return Response({"status": "ok"}, status=status.HTTP_200_OK)

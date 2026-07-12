@@ -508,10 +508,11 @@ const EmployeeDashboard = () => {
                   <div className="p-3 bg-slate-900/80 rounded-lg text-[#98FF98]">
                     <Database className="w-6 h-6" />
                   </div>
-                  <div>
-                    <h3 className="font-semibold text-lg">{db.db_name}</h3>
-                    <span className="text-xs text-slate-400 bg-slate-900/50 px-2 py-1 rounded-full">{db.product_name || 'Nidhi Service'}</span>
-                  </div>
+                   <div>
+                     <h3 className="font-semibold text-lg">{db.db_name}</h3>
+                     <span className="text-xs text-slate-400 bg-slate-900/50 px-2 py-1 rounded-full">{db.product_name || 'Nidhi Service'}</span>
+                     <span className="ml-1 text-xs text-indigo-300 bg-indigo-500/20 px-2 py-1 rounded-full uppercase">{db.engine}</span>
+                   </div>
                 </div>
                 <span className={`text-xs px-2 py-1 rounded-full border ${
                   db.status === 'available' ? 'bg-[#98FF98]/10 text-[#98FF98] border-[#98FF98]/20' : 

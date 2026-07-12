@@ -1,10 +1,25 @@
 from django.db import models
 import uuid
 
+# Engine choices shared across the control plane. Nidhi currently manages
+# PostgreSQL (used by Nexus OMS PRO mode) and Cassandra (used by Nexus OMS for
+# high-volume audit/activity storage). The abstraction is open for more engines.
+ENGINE_CHOICES = [
+    ('postgresql', 'PostgreSQL'),
+    ('cassandra', 'Cassandra'),
+]
+
+DEFAULT_ENGINE = 'postgresql'
+
+def default_port_for_engine(engine):
+    return {'postgresql': 5432, 'cassandra': 9042}.get(engine, 5432)
+
 class DatabaseServer(models.Model):
-    """Represents a remote physical server (Dev, Prod VPS)."""
+    """Represents a remote physical server (Dev, Prod VPS) running one DB engine."""
     name = models.CharField(max_length=100, unique=True, help_text="e.g., Prod VPS 1, Dev Server")
     host = models.CharField(max_length=255)
+    engine = models.CharField(max_length=50, choices=ENGINE_CHOICES, default=DEFAULT_ENGINE,
+                              help_text="Database engine managed on this server")
     port = models.IntegerField(default=5432)
     root_user = models.CharField(max_length=100, default='postgres')
     root_password = models.CharField(max_length=255) # In production, this should be encrypted/vaulted
@@ -13,7 +28,7 @@ class DatabaseServer(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.name} ({self.environment_type})"
+        return f"{self.name} ({self.engine}, {self.environment_type})"
 
 class Product(models.Model):
     """Represents a startup product/project."""
@@ -41,7 +56,7 @@ class EmployeeProductAssignment(models.Model):
         return f"{self.sso_user_id} - {self.product.name} ({self.role})"
 
 class DatabaseInstance(models.Model):
-    """A dynamically provisioned PostgreSQL database on a DatabaseServer."""
+    """A dynamically provisioned database (any supported engine) on a DatabaseServer."""
     STATUS_CHOICES = [
         ('provisioning', 'Provisioning'),
         ('available', 'Available'),
@@ -52,6 +67,8 @@ class DatabaseInstance(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     server = models.ForeignKey(DatabaseServer, on_delete=models.PROTECT, related_name='instances')
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name='databases')
+    engine = models.CharField(max_length=50, choices=ENGINE_CHOICES, default=DEFAULT_ENGINE,
+                              help_text="Database engine of this instance (inherited from server)")
     
     db_name = models.CharField(max_length=63, unique=True)
     db_user = models.CharField(max_length=63, unique=True)

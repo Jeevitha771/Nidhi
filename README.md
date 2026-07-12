@@ -1,6 +1,11 @@
 # Nidhi - Internal DBaaS Control Plane
 
-Nidhi is our proprietary internal Database-as-a-Service (DBaaS) Control Plane. It acts as the central nervous system for our infrastructure, autonomously provisioning, tracking, and managing PostgreSQL databases across our fleet of Data Plane nodes.
+Nidhi is our proprietary internal Database-as-a-Service (DBaaS) Control Plane. It acts as the central nervous system for our infrastructure, autonomously provisioning, tracking, and managing databases across our fleet of Data Plane nodes.
+
+> **Multi-engine:** Nidhi is engine-agnostic. It currently supports **PostgreSQL** and
+> **Cassandra** (used by the Nexus OMS PRO mode for the audit/activity store), behind a
+> common driver interface (`backend/api/engine_drivers/`). Adding MySQL/MongoDB/SQL Server
+> later means dropping in a new driver — no changes to the API, tasks, or UI.
 
 ## Architecture Overview
 
@@ -14,7 +19,7 @@ Nidhi is strictly an **internal-only** application. It operates entirely within 
 ## Core Capabilities
 
 1.  **Autonomous Provisioning (The Nidhi Wrapper):**
-    Future startup products use our lightweight `nidhi-init.sh` Docker entrypoint. When a product boots, it pings Nidhi's `auto-provision` endpoint over the Tailscale mesh. Nidhi dynamically locates an active server, spins up a PostgreSQL database and role via `psycopg2`, and injects the credentials back into the container instantly.
+    Future startup products use our lightweight `nidhi-init.sh` Docker entrypoint. When a product boots, it pings Nidhi's `auto-provision` endpoint over the Tailscale mesh (optionally passing `engine`). Nidhi dynamically locates an active server of the requested engine, spins up a database/keyspace and role via the matching driver, and injects the connection string back into the container instantly.
 2.  **Autonomous Node Registration:**
     New VPS machines running our `install-nidhi-node.sh` script automatically ping Nidhi, lock down their firewalls (UFW to `tailscale0`), spin up a Dockerized PostgreSQL Master, and register themselves securely via the `auto-register` endpoint.
 3.  **Role-Based Access Control (RBAC):**

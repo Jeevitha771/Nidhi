@@ -609,20 +609,20 @@ const DatabaseStudio = () => {
             <h2 className="text-xl font-bold mb-4 text-indigo-600 dark:text-[#98FF98] flex items-center gap-2">
               <Upload className="w-6 h-6" /> Migrate Data from External Database
             </h2>
-            <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">
-              Enter the standard PostgreSQL connection URI of the source database. Nidhi will connect, dump the data, and restore it into this instance.
-            </p>
-            <form onSubmit={handleMigrateData} className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Source Postgres URI</label>
-                <input 
-                  required
-                  type="text" 
-                  value={migrateUri}
-                  onChange={(e) => setMigrateUri(e.target.value)}
-                  className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg px-4 py-2 text-slate-900 dark:text-white outline-none focus:border-indigo-500 font-mono text-sm"
-                  placeholder="postgres://user:password@host:port/dbname"
-                />
+              <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">
+                Enter the connection URI of the source database (e.g. <span className="font-mono">postgres://user:password@host:port/dbname</span>). Nidhi will connect, dump the data, and restore it into this instance. External migration currently supports PostgreSQL sources.
+              </p>
+              <form onSubmit={handleMigrateData} className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Source Database URI</label>
+                  <input 
+                    required
+                    type="text" 
+                    value={migrateUri}
+                    onChange={(e) => setMigrateUri(e.target.value)}
+                    className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg px-4 py-2 text-slate-900 dark:text-white outline-none focus:border-indigo-500 font-mono text-sm"
+                    placeholder="postgres://user:password@host:port/dbname"
+                  />
               </div>
               <div className="flex gap-4 pt-4">
                 <button type="button" onClick={() => setShowMigrateModal(false)} className="flex-1 px-4 py-2 bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-white rounded-lg hover:bg-slate-300 dark:hover:bg-slate-600 transition font-medium">Cancel</button>

@@ -7,6 +7,7 @@ from celery import shared_task
 from django.utils import timezone
 from django.conf import settings
 from .models import DatabaseInstance, DatabaseBackup
+from .engine_drivers import get_driver
 
 logger = logging.getLogger(__name__)
 
@@ -19,55 +20,50 @@ def backup_all_databases():
 
 @shared_task
 def backup_single_database(instance_id):
-    """Runs pg_dump for a specific database instance and stores it."""
+    """Runs an engine-native dump for a specific database instance and stores it."""
     try:
         instance = DatabaseInstance.objects.get(id=instance_id)
         server = instance.server
-        
+        driver = get_driver(instance.engine)
+
         # Create a backup record
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_filename = f"backup_{instance.db_name}_{timestamp}.sql"
-        backup_path = os.path.join('/tmp', backup_filename)
-        
+        # PostgreSQL -> single .sql/.dump file; Cassandra -> directory of CSVs.
+        if instance.engine == 'cassandra':
+            backup_path = os.path.join('/tmp', f"backup_{instance.db_name}_{timestamp}")
+        else:
+            backup_path = os.path.join('/tmp', f"backup_{instance.db_name}_{timestamp}.sql")
+
         backup_record = DatabaseBackup.objects.create(
             instance=instance,
-            s3_path=backup_path, # In production this would be S3 path
+            s3_path=backup_path,  # In production this would be S3 path
             status='in_progress'
         )
-        
-        # Run pg_dump command using postgres client
-        # Note: pg_dump must be installed on the worker container
-        # Since the worker is a python container, we might need to install postgresql-client
-        os.environ['PGPASSWORD'] = server.root_password
-        
-        command = [
-            'pg_dump',
-            '-h', server.host,
-            '-p', str(server.port),
-            '-U', server.root_user,
-            '-F', 'c', # Custom format for pg_restore
-            '-f', backup_path,
-            instance.db_name
-        ]
-        
-        result = subprocess.run(command, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            backup_record.status = 'completed'
+
+        driver.backup(server, instance, backup_path)
+
+        backup_record.status = 'completed'
+        if os.path.isfile(backup_path):
             backup_record.file_size_bytes = os.path.getsize(backup_path)
-            backup_record.save()
-            
-            # Send encrypted backup to Telegram if configured
-            send_telegram_backup_notification.delay(backup_record.id)
         else:
-            backup_record.status = 'failed'
-            backup_record.save()
-            print(f"pg_dump failed for {instance.db_name}: {result.stderr}")
-            
+            # Cassandra backup is a directory; sum the sizes.
+            backup_record.file_size_bytes = sum(
+                os.path.getsize(os.path.join(backup_path, f))
+                for f in os.listdir(backup_path)
+            ) if os.path.isdir(backup_path) else 0
+        backup_record.save()
+
+        # Send encrypted backup to Telegram if configured
+        send_telegram_backup_notification.delay(backup_record.id)
+
     except DatabaseInstance.DoesNotExist:
         pass
     except Exception as e:
         print(f"Backup failed: {str(e)}")
+        try:
+            DatabaseBackup.objects.filter(instance_id=instance_id, status='in_progress').update(status='failed')
+        except Exception:
+            pass
 
 
 @shared_task
@@ -190,176 +186,77 @@ def daily_timed_replica():
         logger.error(f"Daily timed replica failed: {str(e)}")
 
 @shared_task
-def replicate_prod_to_dev(prod_instance_id, dev_server_id, new_db_name):
-    """Takes a backup of Prod and restores it to a Dev server."""
+def replicate_prod_to_dev(prod_instance_id, dev_server_id, new_db_name, engine='postgresql'):
+    """Takes a backup of Prod and restores it to a Dev server (same engine)."""
     import secrets
     import string
-    import psycopg2
-    from psycopg2 import sql
     from .models import DatabaseServer, Product
-    
+
     try:
         prod_instance = DatabaseInstance.objects.get(id=prod_instance_id)
         prod_server = prod_instance.server
         dev_server = DatabaseServer.objects.get(id=dev_server_id)
-        
-        # 1. pg_dump from Prod
-        dump_path = os.path.join('/tmp', f"repl_{prod_instance.db_name}_{datetime.now().strftime('%s')}.sql")
-        
-        os.environ['PGPASSWORD'] = prod_server.root_password
-        dump_cmd = [
-            'pg_dump', '-h', prod_server.host, '-p', str(prod_server.port),
-            '-U', prod_server.root_user, '-F', 'c', '-f', dump_path, prod_instance.db_name
-        ]
-        dump_res = subprocess.run(dump_cmd, capture_output=True, text=True)
-        if dump_res.returncode != 0:
-            raise Exception(f"Failed to dump prod DB: {dump_res.stderr}")
-            
+        src_driver = get_driver(prod_instance.engine)
+
+        # 1. Dump from Prod (engine-native)
+        dump_path = os.path.join('/tmp', f"repl_{prod_instance.db_name}_{datetime.now().strftime('%s')}")
+        if prod_instance.engine != 'cassandra':
+            dump_path += '.sql'
+        src_driver.backup(prod_server, prod_instance, dump_path)
+
         # 2. Create DatabaseInstance record for Dev
         db_user = new_db_name.replace('-', '_')[:50] + "_user"
         new_password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
-        
+
         dev_instance = DatabaseInstance.objects.create(
             server=dev_server,
             product=prod_instance.product,
+            engine=engine,
             db_name=new_db_name,
             db_user=db_user,
             db_password_temp=new_password,
             created_by_sso_id="replication_task",
             status='provisioning'
         )
-        
-        # 3. Create DB and Role on Dev Server
-        conn = psycopg2.connect(dbname="postgres", user=dev_server.root_user, password=dev_server.root_password, host=dev_server.host, port=dev_server.port)
-        conn.autocommit = True
-        cursor = conn.cursor()
-        
-        cursor.execute(sql.SQL("CREATE USER {user} WITH PASSWORD {password}").format(user=sql.Identifier(db_user), password=sql.Literal(new_password)))
-        cursor.execute(sql.SQL("CREATE DATABASE {db}").format(db=sql.Identifier(new_db_name)))
-        cursor.execute(sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {db} TO {user}").format(db=sql.Identifier(new_db_name), user=sql.Identifier(db_user)))
-        cursor.close()
-        conn.close()
 
-        # PG 15+ - grant schema public permissions
-        conn2 = psycopg2.connect(
-            dbname=new_db_name,
-            user=dev_server.root_user,
-            password=dev_server.root_password,
-            host=dev_server.host,
-            port=dev_server.port
-        )
-        conn2.autocommit = True
-        cursor2 = conn2.cursor()
-        cursor2.execute(sql.SQL("GRANT ALL ON SCHEMA public TO {user}").format(
-            user=sql.Identifier(db_user)
-        ))
-        cursor2.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {user}").format(
-            user=sql.Identifier(db_user)
-        ))
-        cursor2.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {user}").format(
-            user=sql.Identifier(db_user)
-        ))
-        cursor2.execute(sql.SQL("ALTER ROLE {user} SET search_path TO public").format(
-            user=sql.Identifier(db_user)
-        ))
-        cursor2.close()
-        conn2.close()
-        
-        # 4. pg_restore to Dev
-        os.environ['PGPASSWORD'] = dev_server.root_password
-        restore_cmd = [
-            'pg_restore', '-h', dev_server.host, '-p', str(dev_server.port),
-            '-U', dev_server.root_user, '-d', new_db_name, '-O', '-x', dump_path
-        ]
-        restore_res = subprocess.run(restore_cmd, capture_output=True, text=True)
-        if restore_res.returncode != 0:
-            dev_instance.status = 'failed'
-            dev_instance.save()
-            raise Exception(f"Failed to restore to dev DB: {restore_res.stderr}")
-            
+        # 3. Provision + restore on Dev using the target engine driver
+        dst_driver = get_driver(engine)
+        dst_driver.provision(dev_server, dev_instance)
+        dst_driver.restore(dev_server, dev_instance, dump_path)
         dev_instance.status = 'available'
         dev_instance.save()
-        
+
         # Cleanup
-        os.remove(dump_path)
-        
+        if os.path.isfile(dump_path):
+            os.remove(dump_path)
+        elif os.path.isdir(dump_path):
+            import shutil
+            shutil.rmtree(dump_path, ignore_errors=True)
+
         return dev_instance.id
-        
+
     except Exception as e:
         print(f"Replication failed: {str(e)}")
         return None
 
 @shared_task
 def provision_database_task(instance_id):
-    """Asynchronously provisions a DatabaseInstance."""
-    import psycopg2
-    from psycopg2 import sql
+    """Asynchronously provisions a DatabaseInstance using its engine driver."""
     from .models import DatabaseInstance
-    
+
     try:
         instance = DatabaseInstance.objects.get(id=instance_id)
         server = instance.server
-        
-        conn = psycopg2.connect(
-            dbname="postgres",
-            user=server.root_user,
-            password=server.root_password,
-            host=server.host,
-            port=server.port
-        )
-        conn.autocommit = True
-        cursor = conn.cursor()
-
-        create_user_query = sql.SQL("CREATE USER {user} WITH PASSWORD {password}").format(
-            user=sql.Identifier(instance.db_user), 
-            password=sql.Literal(instance.db_password_temp)
-        )
-        create_db_query = sql.SQL("CREATE DATABASE {db_name}").format(
-            db_name=sql.Identifier(instance.db_name)
-        )
-        grant_privs_query = sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {db_name} TO {user}").format(
-            db_name=sql.Identifier(instance.db_name), 
-            user=sql.Identifier(instance.db_user)
-        )
-
-        cursor.execute(create_user_query)
-        cursor.execute(create_db_query)
-        cursor.execute(grant_privs_query)
-        cursor.close()
-        conn.close()
-
-        # PG 15+ - grant schema public permissions
-        conn2 = psycopg2.connect(
-            dbname=instance.db_name,
-            user=server.root_user,
-            password=server.root_password,
-            host=server.host,
-            port=server.port
-        )
-        conn2.autocommit = True
-        cursor2 = conn2.cursor()
-        cursor2.execute(sql.SQL("GRANT ALL ON SCHEMA public TO {user}").format(
-            user=sql.Identifier(instance.db_user)
-        ))
-        cursor2.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {user}").format(
-            user=sql.Identifier(instance.db_user)
-        ))
-        cursor2.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {user}").format(
-            user=sql.Identifier(instance.db_user)
-        ))
-        cursor2.execute(sql.SQL("ALTER ROLE {user} SET search_path TO public").format(
-            user=sql.Identifier(instance.db_user)
-        ))
-        cursor2.close()
-        conn2.close()
-
-        instance.status = 'available'
-        instance.save()
+        driver = get_driver(instance.engine)
+        driver.provision(server, instance)
     except Exception as e:
         print(f"Failed to provision database {instance_id}: {str(e)}")
-        instance = DatabaseInstance.objects.get(id=instance_id)
-        instance.status = 'failed'
-        instance.save()
+        try:
+            instance = DatabaseInstance.objects.get(id=instance_id)
+            instance.status = 'failed'
+            instance.save()
+        except Exception:
+            pass
 
 
 @shared_task
@@ -445,20 +342,29 @@ def provision_bucket_task(bucket_id):
 
 @shared_task
 def external_db_migration_task(instance_id, source_uri):
-    """Takes a dump from an external URI and restores it to a Nidhi instance."""
+    """Takes a dump from an external URI and restores it to a Nidhi instance.
+
+    External migration currently supports PostgreSQL sources (pg_dump/pg_restore).
+    """
     import os
     import subprocess
     from .models import DatabaseInstance
-    
+
     try:
         instance = DatabaseInstance.objects.get(id=instance_id)
         server = instance.server
-        
+
+        if instance.engine != 'postgresql':
+            raise Exception(
+                f"External migration is only supported for PostgreSQL instances, "
+                f"not '{instance.engine}'."
+            )
+
         # 1. pg_dump from external URI
         dump_path = os.path.join('/tmp', f"ext_mig_{instance.db_name}.sql")
-        
+
         dump_cmd = [
-            'pg_dump', 
+            'pg_dump',
             source_uri,
             '--no-owner', '--no-privileges',
             '-F', 'c', '-f', dump_path
@@ -466,7 +372,7 @@ def external_db_migration_task(instance_id, source_uri):
         dump_res = subprocess.run(dump_cmd, capture_output=True, text=True)
         if dump_res.returncode != 0:
             raise Exception(f"Failed to dump external DB: {dump_res.stderr}")
-            
+
         # 2. pg_restore to Nidhi DB
         os.environ['PGPASSWORD'] = server.root_password
         restore_cmd = [
@@ -474,16 +380,16 @@ def external_db_migration_task(instance_id, source_uri):
             '-U', server.root_user, '-d', instance.db_name, '-O', '-x', dump_path
         ]
         restore_res = subprocess.run(restore_cmd, capture_output=True, text=True)
-        
+
         # Cleanup
         if os.path.exists(dump_path):
             os.remove(dump_path)
-            
+
         if restore_res.returncode != 0 and "warnings" not in restore_res.stderr.lower():
             print(f"Restore warnings/errors: {restore_res.stderr}")
-            
+
         return instance.id
-        
+
     except Exception as e:
         print(f"Migration failed: {str(e)}")
         return None
